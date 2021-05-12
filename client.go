@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package mobile contains a gomobile friendly API for creating low bandwidth mobile clients
-package mobile
+// Package lowbandwidth contains a gomobile friendly API for creating low bandwidth mobile clients
+package lowbandwidth
 
 import (
 	"bytes"
@@ -30,6 +30,7 @@ import (
 	piondtls "github.com/pion/dtls/v2"
 	"github.com/plgd-dev/go-coap/v2/dtls"
 	"github.com/plgd-dev/go-coap/v2/message"
+	"github.com/plgd-dev/go-coap/v2/net/blockwise"
 	"github.com/plgd-dev/go-coap/v2/udp/client"
 	"github.com/plgd-dev/go-coap/v2/udp/message/pool"
 	"github.com/sirupsen/logrus"
@@ -114,6 +115,7 @@ const (
 var dc *dtlsClients = newDTLSClients()
 var cborCodec *lb.CBORCodec = lb.NewCBORCodecV1(false)
 var coapHTTP *lb.CoAPHTTP = lb.NewCoAPHTTP(lb.NewCoAPPathV1())
+var sendReqCounter int
 
 // Params returns the current connection parameters.
 func Params() *ConnectionParams {
@@ -141,14 +143,17 @@ type Response struct {
 //
 // This function will block until the response is returned, or the request times out.
 func SendRequest(method, hsURL, token, body string) *Response {
-	logrus.Infof("DTLS SendRequest -> %s %s", method, hsURL)
+	reqID := sendReqCounter
+	sendReqCounter += 1
+	logger := logrus.WithField("id", reqID)
+	logger.Infof("DTLS SendRequest -> %s %s", method, hsURL)
 
 	// convert JSON to CBOR
 	var reqBody io.ReadSeeker
 	if body != "" {
 		cborBody, err := cborCodec.JSONToCBOR(bytes.NewBufferString(body))
 		if err != nil {
-			logrus.WithError(err).Error("Failed to convert HTTP request body from JSON to CBOR")
+			logger.WithError(err).Error("Failed to convert HTTP request body from JSON to CBOR")
 			return nil // send request normally
 		}
 		reqBody = bytes.NewReader(cborBody)
@@ -157,7 +162,7 @@ func SendRequest(method, hsURL, token, body string) *Response {
 	// convert HTTP params into an HTTP request
 	req, err := http.NewRequest(method, hsURL, reqBody)
 	if err != nil {
-		logrus.WithError(err).Error("Failed to create HTTP request from params")
+		logger.WithError(err).Error("Failed to create HTTP request from params")
 		return nil
 	}
 	if reqBody != nil {
@@ -167,16 +172,21 @@ func SendRequest(method, hsURL, token, body string) *Response {
 	// fetch a DTLS client (either cached or makes a new conn)
 	u, err := url.Parse(hsURL)
 	if err != nil {
-		logrus.WithError(err).Error("Failed to parse HS URL")
+		logger.WithError(err).Error("Failed to parse HS URL")
 		return nil
 	}
 	if u.Host == "" {
-		logrus.WithField("url", hsURL).Error("HS URL missing host")
+		logger.WithField("url", hsURL).Error("HS URL missing host")
 		return nil
 	}
-	conn, err := dc.getClientForHost(u.Host)
+	targetHost := u.Host
+	if u.Port() == "" {
+		// TODO: get this from /versions
+		targetHost += ":8008"
+	}
+	conn, err := dc.getClientForHost(targetHost)
 	if err != nil {
-		logrus.WithError(err).Errorf("Failed to get DTLS client for host %s", u.Host)
+		logger.WithError(err).Errorf("Failed to get DTLS client for host %s", targetHost)
 		return nil
 	}
 
@@ -197,11 +207,11 @@ func SendRequest(method, hsURL, token, body string) *Response {
 		}
 		select {
 		case r := <-ch:
-			logrus.Infof("Returning real /sync response")
+			logger.Infof("Returning real /sync response")
 			return r
 		case <-time.After(time.Duration(activeConnectionParams.ObserveNoResponseTimeoutSecs) * time.Second):
 			// return a stub response - this keeps clients happy since they think they are syncing ok
-			logrus.Infof("Sending fake /sync response")
+			logger.Infof("Sending fake /sync response")
 			return &Response{
 				Code: 200,
 				Body: `{
@@ -223,13 +233,13 @@ func SendRequest(method, hsURL, token, body string) *Response {
 		return err
 	})
 	if err != nil {
-		logrus.WithError(err).Error("Failed to convert HTTP request to CoAP or to send request")
+		logger.WithError(err).Error("Failed to convert HTTP request to CoAP or to send request")
 
 		if dc.isConnClosed(u.Host) {
-			logrus.Warn("Connection is closed, re-establishing")
+			logger.Warn("Connection is closed, re-establishing")
 			conn, err = dc.getClientForHost(u.Host)
 			if err != nil {
-				logrus.WithError(err).Errorf("Failed to get DTLS client for host %s", u.Host)
+				logger.WithError(err).Errorf("Failed to get DTLS client for host %s", u.Host)
 				return nil
 			}
 			req.Header.Set("Authorization", "Bearer "+token)
@@ -243,7 +253,7 @@ func SendRequest(method, hsURL, token, body string) *Response {
 				return err
 			})
 			if err != nil {
-				logrus.WithError(err).Error("Still failed to convert HTTP request to CoAP or to send request")
+				logger.WithError(err).Error("Still failed to convert HTTP request to CoAP or to send request")
 				return nil
 			}
 			// continue parsing the response
@@ -251,17 +261,18 @@ func SendRequest(method, hsURL, token, body string) *Response {
 			return nil
 		}
 	}
-	logrus.Infof("Got response code: %v", res.Code())
+	logger.Infof("Got response code: %v", res.Code())
 
 	// convert CoAP to HTTP and return the response
 	httpRes := coapHTTP.CoAPToHTTPResponse(res)
 	if httpRes == nil {
+		logger.WithError(err).Error("Failed to convert coap response to http")
 		return nil
 	}
 	// convert CBOR to JSON
 	resBody, err := cborCodec.CBORToJSON(httpRes.Body)
 	if err != nil {
-		logrus.WithError(err).Error("Failed to read response body")
+		logger.WithError(err).Error("Failed to convert cbor response to json")
 		return nil
 	}
 
@@ -386,6 +397,7 @@ func (c *dtlsClients) getClientForHost(host string) (*client.ClientConn, error) 
 			time.Duration(activeConnectionParams.TransmissionACKTimeoutSecs)*time.Second,
 			activeConnectionParams.TransmissionMaxRetransmits,
 		),
+		dtls.WithBlockwise(true, blockwise.SZX1024, 2*time.Minute),
 	)
 	if err == nil {
 		c.conns[host] = co
